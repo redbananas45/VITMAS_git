@@ -1,0 +1,129 @@
+public class TokenRefreshCache {
+    private final TokenCredential tokenCredential;
+    private final TokenRequestContext tokenRequestContext;
+    private final Timer timer = new Timer();
+    private volatile AccessToken accessToken;
+    private final Duration maxRefreshOffset = Duration.ofMinutes(5);
+    private final Duration baseRefreshOffset = Duration.ofMinutes(2);
+    private Jedis jedisInstanceToAuthenticate;
+    private String username;
+
+    public TokenRefreshCache(TokenCredential credential, TokenRequestContext context) {
+        this.tokenCredential = credential;
+        this.tokenRequestContext = context;
+    }
+
+    public AccessToken getAccessToken() {
+        if (accessToken != null) {
+            return accessToken;
+        } else {
+            TokenRefreshTask refreshTask = new TokenRefreshTask();
+            accessToken = tokenCredential.getToken(tokenRequestContext).block();
+            timer.schedule(refreshTask, getTokenRefreshDelay());
+            return accessToken;
+        }
+    }
+
+    private class TokenRefreshTask extends TimerTask {
+        public void run() {
+            accessToken = tokenCredential.getToken(tokenRequestContext).block();
+            username = extractUsernameFromToken(accessToken.getToken());
+            if (jedisInstanceToAuthenticate != null && username != null) {
+                jedisInstanceToAuthenticate.auth(username, accessToken.getToken());
+            }
+            timer.schedule(new TokenRefreshTask(), getTokenRefreshDelay());
+        }
+    }
+
+    private long getTokenRefreshDelay() {
+        return ((accessToken.getExpiresAt()
+            .minusSeconds(ThreadLocalRandom.current().nextLong(baseRefreshOffset.getSeconds(), maxRefreshOffset.getSeconds()))
+            .toEpochSecond() - OffsetDateTime.now().toEpochSecond()) * 1000);
+    }
+
+    public TokenRefreshCache setJedisInstanceToAuthenticate(Jedis jedisInstanceToAuthenticate) {
+        this.jedisInstanceToAuthenticate = jedisInstanceToAuthenticate;
+        return this;
+    }
+
+    private String extractUsernameFromToken(String token) {
+        String[] parts = token.split("\\.");
+        String base64 = parts[1];
+        switch (base64.length() % 4) {
+            case 2 -> base64 += "==";
+            case 3 -> base64 += "=";
+        }
+        byte[] decoded = Base64.getDecoder().decode(base64);
+        String json = new String(decoded, StandardCharsets.UTF_8);
+        JsonObject jwt = JsonParser.parseString(json).getAsJsonObject();
+        return jwt.get("oid").getAsString();
+    }
+}
+
+
+
+
+@Configuration
+public class RedisConfig {
+
+    @Value("${azure.redis.host}")
+    private String redisHost;
+
+    @Value("${azure.redis.port}")
+    private int redisPort;
+
+    @Value("${azure.redis.scope}")
+    private String redisScope;
+
+    @Value("${azure.redis.uami-object-id}")
+    private String uamiObjectId;
+
+    @Bean
+    public DefaultAzureCredential defaultAzureCredential() {
+        return new DefaultAzureCredentialBuilder().build();
+    }
+
+    @Bean
+    public JedisPool jedisPool(DefaultAzureCredential defaultAzureCredential) {
+        TokenRequestContext tokenRequestContext = new TokenRequestContext().addScopes(redisScope);
+        TokenRefreshCache tokenRefreshCache = new TokenRefreshCache(defaultAzureCredential, tokenRequestContext);
+
+        AccessToken token = tokenRefreshCache.getAccessToken();
+        String username = extractUsernameFromToken(token.getToken());
+
+        Jedis jedis = createJedisClient(redisHost, redisPort, username, token.getToken(), true);
+        tokenRefreshCache.setJedisInstanceToAuthenticate(jedis);
+
+        // Creating JedisPool with token as password
+        DefaultJedisClientConfig clientConfig = DefaultJedisClientConfig.builder()
+            .user(username)
+            .password(token.getToken())
+            .ssl(true)
+            .build();
+
+        return new JedisPool(clientConfig, redisHost, redisPort);
+    }
+
+    private Jedis createJedisClient(String host, int port, String username, String token, boolean useSsl) {
+        return new Jedis(host, port, DefaultJedisClientConfig.builder()
+            .user(username)
+            .password(token)
+            .ssl(useSsl)
+            .build());
+    }
+
+    private String extractUsernameFromToken(String token) {
+        String[] parts = token.split("\\.");
+        String base64 = parts[1];
+
+        switch (base64.length() % 4) {
+            case 2 -> base64 += "==";
+            case 3 -> base64 += "=";
+        }
+
+        byte[] decodedBytes = Base64.getDecoder().decode(base64);
+        String json = new String(decodedBytes, StandardCharsets.UTF_8);
+        JsonObject jwt = JsonParser.parseString(json).getAsJsonObject();
+        return jwt.get("oid").getAsString();
+    }
+}
